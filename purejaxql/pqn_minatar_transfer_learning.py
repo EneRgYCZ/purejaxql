@@ -14,6 +14,8 @@ import chex
 import optax
 import flax.linen as nn
 from flax.training.train_state import TrainState
+from flax.core import frozen_dict
+from flax.traverse_util import flatten_dict
 from gymnax.wrappers.purerl import FlattenObservationWrapper, LogWrapper
 import hydra
 from omegaconf import OmegaConf
@@ -88,6 +90,17 @@ class CustomTrainState(TrainState):
     grad_steps: int = 0
 
 
+def restructure_params(flat_params):
+    """Convert flat parameter dict to nested structure."""
+    nested_params = {}
+    for flat_key, value in flat_params.items():
+        parts = flat_key.split(",")
+        current = nested_params
+        for part in parts[:-1]:  # Navigate/create the nested structure
+            current = current.setdefault(part, {})
+        current[parts[-1]] = value  # Assign the actual value
+    return nested_params
+
 def make_train(config, learn):
 
     config["NUM_UPDATES"] = (
@@ -130,7 +143,6 @@ def make_train(config, learn):
         return chosed_actions
 
     def train(rng):
-
         original_rng = rng[0]
 
         eps_scheduler = optax.linear_schedule(
@@ -149,26 +161,58 @@ def make_train(config, learn):
         lr = lr_scheduler if config.get("LR_LINEAR_DECAY", False) else config["LR"]
 
         # INIT NETWORK AND OPTIMIZER
-        if learn:
-            network = QNetwork(
-                action_dim=env.action_space(env_params).n,
-                norm_type=config["NORM_TYPE"],
-                norm_input=config.get("NORM_INPUT", False),
-            )
-        else:
-            network = QNetwork(
-                action_dim=env.action_space(env_params).n,
-                norm_type=config["NORM_TYPE"],
-                norm_input=config.get("NORM_INPUT", False),
-            )
-            network_params = load_file(
-                glob.glob(os.path.join("models", config["ENV_NAME_LEARNING"], "*.safetensors"))[0]
-            )
-            network = network.bind({"params": network_params})
+        network = QNetwork(
+            action_dim=env.action_space(env_params).n,
+            norm_type=config["NORM_TYPE"],
+            norm_input=config.get("NORM_INPUT", False),
+        )
 
-        def create_agent(rng):
+        if not learn:
+            # Load the model parameters
+            safetensors_file = glob.glob(os.path.join("models", config["ENV_NAME_LEARNING"], "*.safetensors"))[0]
+
+            if not safetensors_file:
+                raise FileNotFoundError("No .safetensors file found.")
+
+            loaded_tensors = load_file(safetensors_file)
+
+            # Restructure parameters
+            nested_params = restructure_params(loaded_tensors)
+
+            # Initialize the new network for the current environment
+            init_x = jnp.zeros((1, *env.observation_space(env_params).shape))
+            new_network_variables = network.init(rng, init_x, train=False)
+
+            # Merge loaded params with new params (fallback for mismatched shapes)
+            final_params = jax.tree_map(
+                lambda old, new: old if old.shape == new.shape else new,
+                nested_params,
+                new_network_variables["params"],
+            )
+
+            # Ensure batch_stats is also taken from the newly initialized network
+            batch_stats = new_network_variables["batch_stats"]
+
+            print("Flattened loaded parameter keys:", list(flatten_dict(loaded_tensors).keys()))
+            print("Model parameters successfully loaded and adapted to the new environment.")
+        else:
+            # If learning from scratch, initialize the network
             init_x = jnp.zeros((1, *env.observation_space(env_params).shape))
             network_variables = network.init(rng, init_x, train=False)
+
+            final_params = network_variables["params"]
+            batch_stats = network_variables["batch_stats"]
+
+        def create_agent(rng):
+            # If learning from scratch, use new params, otherwise use the loaded ones
+            if learn:
+                network_variables = network.init(rng, init_x, train=False)
+                params = network_variables["params"]
+                batch_stats = network_variables["batch_stats"]
+            else:
+                params = final_params  # Loaded or merged parameters
+                batch_stats = new_network_variables["batch_stats"]            
+                
             tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
                 optax.radam(learning_rate=lr),
@@ -176,8 +220,8 @@ def make_train(config, learn):
 
             train_state = CustomTrainState.create(
                 apply_fn=network.apply,
-                params=network_variables["params"],
-                batch_stats=network_variables["batch_stats"],
+                params=params,
+                batch_stats=batch_stats,
                 tx=tx,
             )
             return train_state
@@ -458,7 +502,7 @@ def single_run(config, learn):
         project=config["PROJECT"],
         tags=[
             alg_name.upper(),
-            env_name.upper(),
+            f"{env_name.upper()}_BASELINE",
             f"jax_{jax.__version__}",
         ],
         name=f'{config["ALG_NAME"]}_{config["ENV_NAME_LEARNING"]}_transfer_to_{config["ENV_NAME_DEPLOY"]}',
@@ -474,7 +518,7 @@ def single_run(config, learn):
     outs = jax.block_until_ready(train_vjit(rngs))
     print(f"Took {time.time()-t0} seconds to complete.")
 
-    if config.get("SAVE_PATH", None) is not None and learn:
+    """ if config.get("SAVE_PATH", None) is not None and learn:
         from jaxmarl.wrappers.baselines import save_params
 
         model_state = outs["runner_state"][0]
@@ -493,7 +537,7 @@ def single_run(config, learn):
                 save_dir,
                 f'{alg_name}_{env_name}_seed{config["SEED"]}_vmap{i}.safetensors',
             )
-            save_params(params, save_path)
+            save_params(params, save_path) """
 
 
 def tune(default_config):

@@ -11,4 +11,4 @@ __pycache__/
 wandb/
 outputs/
 models/
-purejaxql/config/config.yaml
+.env
