@@ -1,8 +1,6 @@
-"""
-This script is like pqn_gymnax but the network uses a CNN.
-"""
+from json import load
 import os
-import copy 
+import copy
 import time
 import jax
 import jax.numpy as jnp
@@ -10,28 +8,23 @@ import numpy as np
 from functools import partial
 from typing import Any
 
-import chex
 import optax
 import flax.linen as nn
 from flax.training.train_state import TrainState
-from flax.core import frozen_dict
-from flax.traverse_util import flatten_dict
+from flax import struct
 from gymnax.wrappers.purerl import FlattenObservationWrapper, LogWrapper
 import hydra
 from omegaconf import OmegaConf
 import gymnax
 import wandb
-from safetensors.flax import load_file
-import glob
-
+from flax.core.frozen_dict import freeze, unfreeze
+from safetensors.numpy import load_file
 
 class CNN(nn.Module):
-
     norm_type: str = "layer_norm"
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, train: bool):
-
         if self.norm_type == "layer_norm":
             normalize = lambda x: nn.LayerNorm()(x)
         elif self.norm_type == "batch_norm":
@@ -54,7 +47,6 @@ class CNN(nn.Module):
         x = nn.relu(x)
         return x
 
-
 class QNetwork(nn.Module):
     action_dim: int
     norm_type: str = "layer_norm"
@@ -65,23 +57,19 @@ class QNetwork(nn.Module):
         if self.norm_input:
             x = nn.BatchNorm(use_running_average=not train)(x)
         else:
-            # dummy normalize input for global compatibility
-            x_dummy = nn.BatchNorm(use_running_average=not train)(x)
             x = x / 255.0
         x = CNN(norm_type=self.norm_type)(x, train)
         x = nn.Dense(self.action_dim)(x)
         return x
 
-
-@chex.dataclass(frozen=True)
+@struct.dataclass
 class Transition:
-    obs: chex.Array
-    action: chex.Array
-    reward: chex.Array
-    done: chex.Array
-    next_obs: chex.Array
-    q_val: chex.Array
-
+    obs: jnp.ndarray
+    action: jnp.ndarray
+    reward: jnp.ndarray
+    done: jnp.ndarray
+    next_obs: jnp.ndarray
+    q_val: jnp.ndarray
 
 class CustomTrainState(TrainState):
     batch_stats: Any
@@ -89,20 +77,61 @@ class CustomTrainState(TrainState):
     n_updates: int = 0
     grad_steps: int = 0
 
-
-def restructure_params(flat_params):
-    """Convert flat parameter dict to nested structure."""
+def reorganize_parameters(flat_params):
+    """
+    Convert flat parameter dictionary into a nested structure compatible with Flax.
+    """
     nested_params = {}
     for flat_key, value in flat_params.items():
-        parts = flat_key.split(",")
-        current = nested_params
-        for part in parts[:-1]:  # Navigate/create the nested structure
-            current = current.setdefault(part, {})
-        current[parts[-1]] = value  # Assign the actual value
+        # Split the flat key into hierarchical keys
+        keys = flat_key.split(',')
+        d = nested_params
+        for k in keys[:-1]:
+            d = d.setdefault(k, {})
+        d[keys[-1]] = value
     return nested_params
 
-def make_train(config, learn):
+def load_model_parameters(file_path):
+    """
+    Load the model parameters and batch_stats from a safetensors file and return them
+    as nested dictionaries suitable for TrainState.
+    """
+    loaded = load_file(file_path)
+    # Reorganize parameters into hierarchical structure
+    params_dict = reorganize_parameters(loaded)
+    return freeze(params_dict), freeze({})
 
+def filter_out_batch_norm(d):
+    """Recursively remove keys that contain 'BatchNorm'."""
+    new_d = {}
+    for k, v in d.items():
+        if isinstance(v, dict):
+            filtered_sub = filter_out_batch_norm(v)
+            if filtered_sub:  # Only add if not empty
+                new_d[k] = filtered_sub
+        else:
+            if 'BatchNorm' not in k:
+                new_d[k] = v
+    return freeze(new_d)  # Freeze the result to ensure immutability
+
+
+def merge_params(original, loaded):
+    for k, v in loaded.items():
+        if k in original and isinstance(v, dict) and isinstance(original[k], dict):
+            merge_params(original[k], v)
+        else:
+            if k in original:
+                original[k] = v
+    return freeze(original)  # Ensure the result is frozen
+
+# Ensure the merged params are frozen
+def merge_and_freeze_params(original, loaded):
+    merged_params = merge_params(original, loaded)
+    return freeze(merged_params)
+
+def make_train(config):
+
+    env_name_learning = config["ENV_NAME_DEPLOY"]
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
@@ -111,36 +140,26 @@ def make_train(config, learn):
         config["TOTAL_TIMESTEPS_DECAY"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
 
-    assert (config["NUM_STEPS"] * config["NUM_ENVS"]) % config[
-        "NUM_MINIBATCHES"
-    ] == 0, "NUM_MINIBATCHES must divide NUM_STEPS*NUM_ENVS"
+    assert (config["NUM_STEPS"] * config["NUM_ENVS"]) % config["NUM_MINIBATCHES"] == 0, "NUM_MINIBATCHES must divide NUM_STEPS*NUM_ENVS"
 
-    env, env_params = gymnax.make(config["ENV_NAME_LEARNING"] if learn else config["ENV_NAME_DEPLOY"])
+    env, env_params = gymnax.make(env_name_learning)
     env = LogWrapper(env)
     config["TEST_NUM_STEPS"] = env_params.max_steps_in_episode
 
-    vmap_reset = lambda n_envs: lambda rng: jax.vmap(env.reset, in_axes=(0, None))(
-        jax.random.split(rng, n_envs), env_params
-    )
+    vmap_reset = lambda n_envs: lambda rng: jax.vmap(env.reset, in_axes=(0, None))(jax.random.split(rng, n_envs), env_params)
     vmap_step = lambda n_envs: lambda rng, env_state, action: jax.vmap(
         env.step, in_axes=(0, 0, 0, None)
     )(jax.random.split(rng, n_envs), env_state, action, env_params)
 
-    # epsilon-greedy exploration
     def eps_greedy_exploration(rng, q_vals, eps):
-        rng_a, rng_e = jax.random.split(
-            rng
-        )  # a key for sampling random actions and one for picking
+        rng_a, rng_e = jax.random.split(rng)
         greedy_actions = jnp.argmax(q_vals, axis=-1)
-        chosed_actions = jnp.where(
-            jax.random.uniform(rng_e, greedy_actions.shape)
-            < eps,  # pick the actions that should be random
-            jax.random.randint(
-                rng_a, shape=greedy_actions.shape, minval=0, maxval=q_vals.shape[-1]
-            ),  # sample random actions,
+        chosen_actions = jnp.where(
+            jax.random.uniform(rng_e, greedy_actions.shape) < eps,
+            jax.random.randint(rng_a, shape=greedy_actions.shape, minval=0, maxval=q_vals.shape[-1]),
             greedy_actions,
         )
-        return chosed_actions
+        return chosen_actions
 
     def train(rng):
         original_rng = rng[0]
@@ -160,59 +179,15 @@ def make_train(config, learn):
         )
         lr = lr_scheduler if config.get("LR_LINEAR_DECAY", False) else config["LR"]
 
-        # INIT NETWORK AND OPTIMIZER
         network = QNetwork(
-            action_dim=env.action_space(env_params).n,
+            action_dim=gymnax.make(env_name_learning)[0].action_space(env_params).n,
             norm_type=config["NORM_TYPE"],
             norm_input=config.get("NORM_INPUT", False),
         )
 
-        if not learn:
-            # Load the model parameters
-            safetensors_file = glob.glob(os.path.join("models", config["ENV_NAME_LEARNING"], "*.safetensors"))[0]
-
-            if not safetensors_file:
-                raise FileNotFoundError("No .safetensors file found.")
-
-            loaded_tensors = load_file(safetensors_file)
-
-            # Restructure parameters
-            nested_params = restructure_params(loaded_tensors)
-
-            # Initialize the new network for the current environment
-            init_x = jnp.zeros((1, *env.observation_space(env_params).shape))
-            new_network_variables = network.init(rng, init_x, train=False)
-
-            # Merge loaded params with new params (fallback for mismatched shapes)
-            final_params = jax.tree_map(
-                lambda old, new: old if old.shape == new.shape else new,
-                nested_params,
-                new_network_variables["params"],
-            )
-
-            # Ensure batch_stats is also taken from the newly initialized network
-            batch_stats = new_network_variables["batch_stats"]
-
-            print("Flattened loaded parameter keys:", list(flatten_dict(loaded_tensors).keys()))
-            print("Model parameters successfully loaded and adapted to the new environment.")
-        else:
-            # If learning from scratch, initialize the network
+        def create_agent(rng):
             init_x = jnp.zeros((1, *env.observation_space(env_params).shape))
             network_variables = network.init(rng, init_x, train=False)
-
-            final_params = network_variables["params"]
-            batch_stats = network_variables["batch_stats"]
-
-        def create_agent(rng):
-            # If learning from scratch, use new params, otherwise use the loaded ones
-            if learn:
-                network_variables = network.init(rng, init_x, train=False)
-                params = network_variables["params"]
-                batch_stats = network_variables["batch_stats"]
-            else:
-                params = final_params  # Loaded or merged parameters
-                batch_stats = new_network_variables["batch_stats"]            
-                
             tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
                 optax.radam(learning_rate=lr),
@@ -220,8 +195,8 @@ def make_train(config, learn):
 
             train_state = CustomTrainState.create(
                 apply_fn=network.apply,
-                params=params,
-                batch_stats=batch_stats,
+                params=freeze(network_variables["params"]),  # Ensure params are frozen here
+                batch_stats=network_variables.get("batch_stats", {}),
                 tx=tx,
             )
             return train_state
@@ -229,7 +204,87 @@ def make_train(config, learn):
         rng, _rng = jax.random.split(rng)
         train_state = create_agent(rng)
 
-        # TRAINING LOOP
+        # Load pretrained parameters if specified
+        if "LOAD_PATH" in config and config["LOAD_PATH"] is not None:
+            load_path = config["LOAD_PATH"]
+            loaded_params, loaded_batch_stats = load_model_parameters(load_path)
+
+            # Unfreeze loaded parameters to make them mutable
+            unfiltered_params = unfreeze(loaded_params)
+
+            # Filter out BatchNorm parameters
+            filtered_params_loaded = unfreeze(filter_out_batch_norm(unfiltered_params))
+
+            input_shape = env.observation_space(env_params).shape  # (Height, Width, Channels)
+            input_channels = input_shape[-1] 
+
+            # Reinitialize the input layer to match the deployment environment
+            """ filtered_params_loaded["CNN_0"]["Conv_0"] = {
+                "kernel": jax.random.normal(rng, (3, 3, input_channels, 16)),
+                "bias": jnp.zeros(16),
+            } """
+
+            # Reinitialize the output layer to match the deployment environment
+            filtered_params_loaded["Dense_0"] = {
+                "kernel": jax.random.normal(rng, (128, env.action_space(env_params).n)),
+                "bias": jnp.zeros(env.action_space(env_params).n),
+            }
+
+            # Freeze the modified parameters
+            filtered_params_loaded = freeze(filtered_params_loaded)
+
+            # Merge the parameters
+            params_new = merge_and_freeze_params(unfreeze(train_state.params), filtered_params_loaded)
+
+            # Replace params in train_state
+            train_state = train_state.replace(
+                params=params_new,
+                batch_stats=train_state.batch_stats
+            )
+            print("Loaded pretrained parameters and updated output layer for:", load_path)
+
+        def get_test_metrics(train_state, rng):
+            if not config.get("TEST_DURING_TRAINING", False):
+                return None
+
+            def _env_step(carry, _):
+                env_state, last_obs, rng = carry
+                rng, _rng = jax.random.split(rng)
+                q_vals = network.apply(
+                    {
+                        "params": train_state.params,
+                        "batch_stats": train_state.batch_stats,
+                    },
+                    last_obs,
+                    train=False,
+                )
+                eps = jnp.full(config["TEST_NUM_ENVS"], config["EPS_TEST"])
+                action = jax.vmap(eps_greedy_exploration)(
+                    jax.random.split(_rng, config["TEST_NUM_ENVS"]), q_vals, eps
+                )
+                new_obs, new_env_state, reward, done, info = vmap_step(
+                    config["TEST_NUM_ENVS"]
+                )(_rng, env_state, action)
+                return (new_env_state, new_obs, rng), info
+
+            rng, _rng = jax.random.split(rng)
+            init_obs, env_state = vmap_reset(config["TEST_NUM_ENVS"])(_rng)
+
+            _, infos = jax.lax.scan(
+                _env_step, (env_state, init_obs, _rng), None, config["TEST_NUM_STEPS"]
+            )
+            done_infos = jax.tree_map(
+                lambda x: jnp.nanmean(
+                    jnp.where(
+                        infos["returned_episode"],
+                        x,
+                        jnp.nan,
+                    )
+                ),
+                infos,
+            )
+            return done_infos
+
         def _update_step(runner_state, unused):
 
             train_state, expl_state, test_metrics, rng = runner_state
@@ -247,7 +302,6 @@ def make_train(config, learn):
                     train=False,
                 )
 
-                # different eps for each env
                 _rngs = jax.random.split(rng_a, config["NUM_ENVS"])
                 eps = jnp.full(config["NUM_ENVS"], eps_scheduler(train_state.n_updates))
                 new_action = jax.vmap(eps_greedy_exploration)(_rngs, q_vals, eps)
@@ -266,7 +320,6 @@ def make_train(config, learn):
                 )
                 return (new_obs, new_env_state, rng), (transition, info)
 
-            # step the env
             rng, _rng = jax.random.split(rng)
             (*expl_state, rng), (transitions, infos) = jax.lax.scan(
                 _step_env,
@@ -277,9 +330,8 @@ def make_train(config, learn):
             expl_state = tuple(expl_state)
 
             train_state = train_state.replace(
-                timesteps=train_state.timesteps
-                + config["NUM_STEPS"] * config["NUM_ENVS"]
-            )  # update timesteps count
+                timesteps=train_state.timesteps + config["NUM_STEPS"] * config["NUM_ENVS"]
+            )
 
             last_q = network.apply(
                 {
@@ -316,7 +368,6 @@ def make_train(config, learn):
             )
             lambda_targets = jnp.concatenate((targets, lambda_returns[np.newaxis]))
 
-            # NETWORKS UPDATE
             def _learn_epoch(carry, _):
                 train_state, rng = carry
 
@@ -331,7 +382,7 @@ def make_train(config, learn):
                             minibatch.obs,
                             train=True,
                             mutable=["batch_stats"],
-                        )  # (batch_size*2, num_actions)
+                        )
 
                         chosen_action_qvals = jnp.take_along_axis(
                             q_vals,
@@ -340,7 +391,6 @@ def make_train(config, learn):
                         ).squeeze(axis=-1)
 
                         loss = 0.5 * jnp.square(chosen_action_qvals - target).mean()
-
                         return loss, (updates, chosen_action_qvals)
 
                     (loss, (updates, qvals)), grads = jax.value_and_grad(
@@ -356,17 +406,17 @@ def make_train(config, learn):
                 def preprocess_transition(x, rng):
                     x = x.reshape(
                         -1, *x.shape[2:]
-                    )  # num_steps*num_envs (batch_size), ...
-                    x = jax.random.permutation(rng, x)  # shuffle the transitions
+                    )
+                    x = jax.random.permutation(rng, x)
                     x = x.reshape(
                         config["NUM_MINIBATCHES"], -1, *x.shape[1:]
-                    )  # num_mini_updates, batch_size/num_mini_updates, ...
+                    )
                     return x
 
                 rng, _rng = jax.random.split(rng)
                 minibatches = jax.tree_util.tree_map(
                     lambda x: preprocess_transition(x, _rng), transitions
-                )  # num_actors*num_envs (batch_size), ...
+                )
                 targets = jax.tree_map(
                     lambda x: preprocess_transition(x, _rng), lambda_targets
                 )
@@ -404,11 +454,9 @@ def make_train(config, learn):
                     lambda _: test_metrics,
                     operand=None,
                 )
-                metrics.update({f"test_{k}": v for k, v in test_metrics.items()})
+                metrics.update({f"test_{k}": v for k, v in (test_metrics or {}).items()})
 
-            # report on wandb if required
             if config["WANDB_MODE"] != "disabled":
-
                 def callback(metrics, original_rng):
                     if config.get("WANDB_LOG_ALL_SEEDS", False):
                         metrics.update(
@@ -422,52 +470,7 @@ def make_train(config, learn):
                 jax.debug.callback(callback, metrics, original_rng)
 
             runner_state = (train_state, tuple(expl_state), test_metrics, rng)
-
             return runner_state, metrics
-
-        def get_test_metrics(train_state, rng):
-
-            if not config.get("TEST_DURING_TRAINING", False):
-                return None
-
-            def _env_step(carry, _):
-                env_state, last_obs, rng = carry
-                rng, _rng = jax.random.split(rng)
-                q_vals = network.apply(
-                    {
-                        "params": train_state.params,
-                        "batch_stats": train_state.batch_stats,
-                    },
-                    last_obs,
-                    train=False,
-                )
-                eps = jnp.full(config["TEST_NUM_ENVS"], config["EPS_TEST"])
-                action = jax.vmap(eps_greedy_exploration)(
-                    jax.random.split(_rng, config["TEST_NUM_ENVS"]), q_vals, eps
-                )
-                new_obs, new_env_state, reward, done, info = vmap_step(
-                    config["TEST_NUM_ENVS"]
-                )(_rng, env_state, action)
-                return (new_env_state, new_obs, rng), info
-
-            rng, _rng = jax.random.split(rng)
-            init_obs, env_state = vmap_reset(config["TEST_NUM_ENVS"])(_rng)
-
-            _, infos = jax.lax.scan(
-                _env_step, (env_state, init_obs, _rng), None, config["TEST_NUM_STEPS"]
-            )
-            # return mean of done infos
-            done_infos = jax.tree_map(
-                lambda x: jnp.nanmean(
-                    jnp.where(
-                        infos["returned_episode"],
-                        x,
-                        jnp.nan,
-                    )
-                ),
-                infos,
-            )
-            return done_infos
 
         rng, _rng = jax.random.split(rng)
         test_metrics = get_test_metrics(train_state, _rng)
@@ -475,7 +478,6 @@ def make_train(config, learn):
         rng, _rng = jax.random.split(rng)
         expl_state = vmap_reset(config["NUM_ENVS"])(_rng)
 
-        # train
         rng, _rng = jax.random.split(rng)
         runner_state = (train_state, expl_state, test_metrics, _rng)
 
@@ -487,25 +489,23 @@ def make_train(config, learn):
 
     return train
 
+def single_run(config):
 
-
-def single_run(config, learn):
     config = {**config, **config["alg"]}
     print(config)
 
     alg_name = config.get("ALG_NAME", "pqn")
-    env_name = config["ENV_NAME_LEARNING"] if learn else config["ENV_NAME_DEPLOY"]
-    print(env_name)
+    env_name_deploy = config["ENV_NAME_DEPLOY"]
 
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
         tags=[
             alg_name.upper(),
-            f"{env_name.upper()}_BASELINE",
+            env_name_deploy.upper(),
             f"jax_{jax.__version__}",
         ],
-        name=f'{config["ALG_NAME"]}_{config["ENV_NAME_LEARNING"]}_transfer_to_{config["ENV_NAME_DEPLOY"]}',
+        name=f'{env_name_deploy}_Transfer_From_{config["ENV_NAME_LEARNING"]}',
         config=config,
         mode=config["WANDB_MODE"],
     )
@@ -514,90 +514,21 @@ def single_run(config, learn):
 
     t0 = time.time()
     rngs = jax.random.split(rng, config["NUM_SEEDS"])
-    train_vjit = jax.jit(jax.vmap(make_train(config, learn)))
+    train_vjit = jax.jit(jax.vmap(make_train(config)))
     outs = jax.block_until_ready(train_vjit(rngs))
     print(f"Took {time.time()-t0} seconds to complete.")
 
-    """ if config.get("SAVE_PATH", None) is not None and learn:
-        from jaxmarl.wrappers.baselines import save_params
-
-        model_state = outs["runner_state"][0]
-        save_dir = os.path.join(config["SAVE_PATH"], env_name)
-        os.makedirs(save_dir, exist_ok=True)
-        OmegaConf.save(
-            config,
-            os.path.join(
-                save_dir, f'{alg_name}_{env_name}_seed{config["SEED"]}_config.yaml'
-            ),
-        )
-
-        for i, rng in enumerate(rngs):
-            params = jax.tree_map(lambda x: x[i], model_state.params)
-            save_path = os.path.join(
-                save_dir,
-                f'{alg_name}_{env_name}_seed{config["SEED"]}_vmap{i}.safetensors',
-            )
-            save_params(params, save_path) """
-
-
-def tune(default_config):
-    """Hyperparameter sweep with wandb."""
-
-    default_config = {**default_config, **default_config["alg"]}
-    print(default_config)
-    alg_name = default_config.get("ALG_NAME", "pqn")
-    env_name = default_config["ENV_NAME"]
-
-    def wrapped_make_train():
-        wandb.init(project=default_config["PROJECT"])
-
-        config = copy.deepcopy(default_config)
-        for k, v in dict(wandb.config).items():
-            config[k] = v
-
-            print("running experiment with params:", config)
-
-            rng = jax.random.PRNGKey(config["SEED"])
-            rngs = jax.random.split(rng, config["NUM_SEEDS"])
-            train_vjit = jax.jit(jax.vmap(make_train(config)))
-            outs = jax.block_until_ready(train_vjit(rngs))
-
-    sweep_config = {
-        "name": f"{alg_name}_{env_name}",
-        "method": "bayes",
-        "metric": {
-            "name": "test_returned_episode_returns",
-            "goal": "maximize",
-        },
-        "parameters": {
-            "LR": {
-                "values": [
-                    0.001,
-                    0.0005,
-                    0.0001,
-                    0.00005,
-                ]
-            },
-        },
-    }
-
-    wandb.login()
-    sweep_id = wandb.sweep(
-        sweep_config, entity=default_config["ENTITY"], project=default_config["PROJECT"]
-    )
-    wandb.agent(sweep_id, wrapped_make_train, count=1000)
-
+    # If you want to save again, uncomment the following lines
+    # if config.get("SAVE_PATH", None) is not None:
+    #     model_state = outs["runner_state"][0]
+    #     save_dir = os.path.join(config["SAVE_PATH"], env_name_deploy)
+    #     save_model_parameters(model_state, save_dir, alg_name, env_name_deploy, config["NUM_SEEDS"])
 
 @hydra.main(version_base=None, config_path="./config", config_name="config")
 def main(config):
     config = OmegaConf.to_container(config)
     print("Config:\n", OmegaConf.to_yaml(config))
-    if config["HYP_TUNE"]:
-        tune(config)
-    else:
-        single_run(config, False)
-
+    single_run(config)
 
 if __name__ == "__main__":
     main()
-
