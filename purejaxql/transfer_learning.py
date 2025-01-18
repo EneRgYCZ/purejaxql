@@ -1,24 +1,20 @@
-from json import load
-import os
-import copy
 import time
 import jax
-import jax.numpy as jnp
 import numpy as np
-from functools import partial
 from typing import Any
+import jax.numpy as jnp
 
-import optax
-import flax.linen as nn
-from flax.training.train_state import TrainState
-from flax import struct
-from gymnax.wrappers.purerl import FlattenObservationWrapper, LogWrapper
-import hydra
-from omegaconf import OmegaConf
-import gymnax
 import wandb
-from flax.core.frozen_dict import freeze, unfreeze
+import hydra
+import optax
+import gymnax
+from flax import struct
+import flax.linen as nn
+from omegaconf import OmegaConf
 from safetensors.numpy import load_file
+from flax.core.frozen_dict import freeze, unfreeze
+from flax.training.train_state import TrainState
+from gymnax.wrappers.purerl import FlattenObservationWrapper, LogWrapper
 
 class CNN(nn.Module):
     norm_type: str = "layer_norm"
