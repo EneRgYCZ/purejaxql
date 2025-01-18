@@ -207,7 +207,7 @@ def make_train(config):
         # Load pretrained parameters if specified
         if "LOAD_PATH" in config and config["LOAD_PATH"] is not None:
             load_path = config["LOAD_PATH"]
-            loaded_params, loaded_batch_stats = load_model_parameters(load_path)
+            loaded_params, _ = load_model_parameters(load_path)
 
             # Unfreeze loaded parameters to make them mutable
             unfiltered_params = unfreeze(loaded_params)
