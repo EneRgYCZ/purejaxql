@@ -435,7 +435,6 @@ def make_train(config):
 def single_run(config):
 
     config = {**config, **config["alg"]}
-    print(config)
 
     alg_name = config.get("ALG_NAME", "pqn")
     env_name = config["ENV_NAME"]
@@ -534,7 +533,6 @@ def tune(default_config):
 @hydra.main(version_base=None, config_path="./config", config_name="config")
 def main(config):
     config = OmegaConf.to_container(config)
-    print("Config:\n", OmegaConf.to_yaml(config))
     if config["HYP_TUNE"]:
         tune(config)
     else:

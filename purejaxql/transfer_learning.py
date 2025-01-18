@@ -219,10 +219,10 @@ def make_train(config):
             input_channels = input_shape[-1] 
 
             # Reinitialize the input layer to match the deployment environment
-            """ filtered_params_loaded["CNN_0"]["Conv_0"] = {
+            filtered_params_loaded["CNN_0"]["Conv_0"] = {
                 "kernel": jax.random.normal(rng, (3, 3, input_channels, 16)),
                 "bias": jnp.zeros(16),
-            } """
+            }
 
             # Reinitialize the output layer to match the deployment environment
             filtered_params_loaded["Dense_0"] = {
@@ -241,7 +241,6 @@ def make_train(config):
                 params=params_new,
                 batch_stats=train_state.batch_stats
             )
-            print("Loaded pretrained parameters and updated output layer for:", load_path)
 
         def get_test_metrics(train_state, rng):
             if not config.get("TEST_DURING_TRAINING", False):
@@ -492,7 +491,6 @@ def make_train(config):
 def single_run(config):
 
     config = {**config, **config["alg"]}
-    print(config)
 
     alg_name = config.get("ALG_NAME", "pqn")
     env_name_deploy = config["ENV_NAME_DEPLOY"]
@@ -527,7 +525,6 @@ def single_run(config):
 @hydra.main(version_base=None, config_path="./config", config_name="config")
 def main(config):
     config = OmegaConf.to_container(config)
-    print("Config:\n", OmegaConf.to_yaml(config))
     single_run(config)
 
 if __name__ == "__main__":
