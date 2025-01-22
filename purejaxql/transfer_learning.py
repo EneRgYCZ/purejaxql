@@ -367,16 +367,16 @@ def make_train(config):
                 train_state, rng = carry
 
                 def _learn_phase(carry, minibatch_and_target):
-
                     train_state, rng = carry
                     minibatch, target = minibatch_and_target
 
                     def _loss_fn(params):
+                        # Apply the network with the current (mutable) parameters
                         q_vals, updates = network.apply(
                             {"params": params, "batch_stats": train_state.batch_stats},
                             minibatch.obs,
                             train=True,
-                            mutable=["batch_stats"],
+                            mutable=["batch_stats"],  # Batch norm updates if needed
                         )
 
                         chosen_action_qvals = jnp.take_along_axis(
@@ -388,14 +388,20 @@ def make_train(config):
                         loss = 0.5 * jnp.square(chosen_action_qvals - target).mean()
                         return loss, (updates, chosen_action_qvals)
 
+                    # Unfreeze the parameters to allow updates
+                    mutable_params = unfreeze(train_state.params)
+
+                    # Calculate loss and gradients
                     (loss, (updates, qvals)), grads = jax.value_and_grad(
                         _loss_fn, has_aux=True
-                    )(train_state.params)
-                    train_state = train_state.apply_gradients(grads=grads)
-                    train_state = train_state.replace(
-                        grad_steps=train_state.grad_steps + 1,
-                        batch_stats=updates["batch_stats"],
-                    )
+                    )(mutable_params)
+
+                    # Apply the gradients
+                    train_state = train_state.apply_gradients(grads=freeze(grads))
+
+                    # Update batch_stats if necessary
+                    train_state = train_state.replace(batch_stats=updates["batch_stats"])
+
                     return (train_state, rng), (loss, qvals)
 
                 def preprocess_transition(x, rng):
