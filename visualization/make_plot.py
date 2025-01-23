@@ -41,7 +41,7 @@ def process_files(file_list, rolling_window=10, policy_type="", subfolder_name="
      data_frames = []
      for file in file_list:
           # Load the CSV file
-          df = pd.read_csv(file, usecols=[0, 4], header=0)  # Column A (env_step) and E (return)
+          df = pd.read_csv(file, usecols=[0, 1], header=0)  # Column A (env_step) and E (return)
           df.columns = ['env_step', 'return']
           
           # Apply additional filtering for Target Policy files (files with "NN")

@@ -1,5 +1,7 @@
-import time
+import os
 import jax
+import csv
+import time
 import numpy as np
 from typing import Any
 import jax.numpy as jnp
@@ -97,33 +99,62 @@ def load_model_parameters(file_path):
     params_dict = reorganize_parameters(loaded)
     return freeze(params_dict), freeze({})
 
-def filter_out_batch_norm(d):
-    """Recursively remove keys that contain 'BatchNorm'."""
-    new_d = {}
-    for k, v in d.items():
-        if isinstance(v, dict):
-            filtered_sub = filter_out_batch_norm(v)
-            if filtered_sub:  # Only add if not empty
-                new_d[k] = filtered_sub
-        else:
-            if 'BatchNorm' not in k:
-                new_d[k] = v
-    return freeze(new_d)  # Freeze the result to ensure immutability
+def reinitialize_layers_from_loaded(
+    loaded_params,
+    input_channels=None,
+    output_dim=None,
+    reinit_input=False,
+    reinit_output=False,
+):
+    """
+    Reinitialize the input and/or output layers of a loaded model while retaining other layers.
+    Args:
+        loaded_params (dict): The pretrained parameters loaded from a safetensor.
+        input_channels (int, optional): New input channels for the input layer (conv layer).
+        output_dim (int, optional): New output dimension for the output layer (dense layer).
+        reinit_input (bool): Whether to reinitialize the input layer.
+        reinit_output (bool): Whether to reinitialize the output layer.
+    Returns:
+        frozen_dict: Updated parameters with the reinitialized layers.
+    """
+    params = unfreeze(loaded_params)  # Make the parameter dictionary mutable
 
+    # Reinitialize Conv_0 in CNN_0 (Input Layer)
+    if reinit_input and "CNN_0" in params and "Conv_0" in params["CNN_0"]:
+        conv_layer = params["CNN_0"]["Conv_0"]
+        kernel_shape = conv_layer["kernel"].shape
 
-def merge_params(original, loaded):
-    for k, v in loaded.items():
-        if k in original and isinstance(v, dict) and isinstance(original[k], dict):
-            merge_params(original[k], v)
-        else:
-            if k in original:
-                original[k] = v
-    return freeze(original)  # Ensure the result is frozen
+        if input_channels is None:
+            raise ValueError("Input channels must be specified to reinitialize the input layer.")
 
-# Ensure the merged params are frozen
-def merge_and_freeze_params(original, loaded):
-    merged_params = merge_params(original, loaded)
-    return freeze(merged_params)
+        # Update kernel and bias for Conv_0
+        new_kernel_shape = (kernel_shape[0], kernel_shape[1], input_channels, kernel_shape[3])
+        conv_layer["kernel"] = nn.initializers.he_normal()(jax.random.PRNGKey(0), new_kernel_shape)
+        conv_layer["bias"] = jnp.zeros((new_kernel_shape[-1],), dtype=jnp.float32)
+
+    # Reinitialize Dense_0 (Output Layer)
+    if reinit_output and "Dense_0" in params:
+        dense_layer = params["Dense_0"]
+        kernel_shape = dense_layer["kernel"].shape
+
+        if output_dim is None:
+            raise ValueError("Output dimension must be specified to reinitialize the output layer.")
+
+        # Update kernel and bias for Dense_0
+        new_kernel_shape = (kernel_shape[0], output_dim)
+        dense_layer["kernel"] = nn.initializers.he_normal()(jax.random.PRNGKey(1), new_kernel_shape)
+        dense_layer["bias"] = jnp.zeros((output_dim,), dtype=jnp.float32)
+
+    # Ensure LayerNorm parameters remain consistent
+    for layer in ["LayerNorm_0", "LayerNorm_1"]:
+        if layer in params["CNN_0"]:
+            params["CNN_0"][layer] = loaded_params["CNN_0"][layer]
+
+    # Remove BatchNorm if present
+    if "BatchNorm_0" in params:
+        del params["BatchNorm_0"]
+
+    return freeze(params)  # Freeze updated parameters for immutability
 
 def make_train(config):
 
@@ -205,38 +236,22 @@ def make_train(config):
             load_path = config["LOAD_PATH"]
             loaded_params, _ = load_model_parameters(load_path)
 
-            # Unfreeze loaded parameters to make them mutable
-            unfiltered_params = unfreeze(loaded_params)
-
-            # Filter out BatchNorm parameters
-            filtered_params_loaded = unfreeze(filter_out_batch_norm(unfiltered_params))
-
+            # New input and output specifications
             input_shape = env.observation_space(env_params).shape  # (Height, Width, Channels)
-            input_channels = input_shape[-1] 
+            input_channels = input_shape[-1]  # Number of input channels
+            output_dim = env.action_space(env_params).n  # Number of actions
 
-            # Reinitialize the input layer to match the deployment environment
-            filtered_params_loaded["CNN_0"]["Conv_0"] = {
-                "kernel": jax.random.normal(rng, (3, 3, input_channels, 16)),
-                "bias": jnp.zeros(16),
-            }
-
-            # Reinitialize the output layer to match the deployment environment
-            filtered_params_loaded["Dense_0"] = {
-                "kernel": jax.random.normal(rng, (128, env.action_space(env_params).n)),
-                "bias": jnp.zeros(env.action_space(env_params).n),
-            }
-
-            # Freeze the modified parameters
-            filtered_params_loaded = freeze(filtered_params_loaded)
-
-            # Merge the parameters
-            params_new = merge_and_freeze_params(unfreeze(train_state.params), filtered_params_loaded)
-
-            # Replace params in train_state
-            train_state = train_state.replace(
-                params=params_new,
-                batch_stats=train_state.batch_stats
+            # Reinitialize the desired layers
+            reinitialized_params = reinitialize_layers_from_loaded(
+                loaded_params=loaded_params,
+                input_channels=input_channels,
+                output_dim=output_dim,
+                reinit_input=True,  # Reinitialize input layer
+                reinit_output=True,  # Reinitialize output layer
             )
+
+            # Update the train state
+            train_state = train_state.replace(params=reinitialized_params)
 
         def get_test_metrics(train_state, rng):
             if not config.get("TEST_DURING_TRAINING", False):
@@ -490,12 +505,61 @@ def make_train(config):
 
     return train
 
+import os
+import time
+import wandb
+
+def download_csv_from_wandb(run_id, project_name, entity_name, save_dir):
+    """
+    Download the CSV files for a specific WandB run.
+    """
+    api = wandb.Api()
+
+    # Fetch the run
+    run = api.run(f"{entity_name}/{project_name}/{run_id}")
+    history = run.history(pandas=False)
+
+    # Initialize data holders
+    env_steps = []
+    returned_returns = []
+    test_returned_returns = []
+
+    # Extract data from WandB history
+    for entry in history:
+        if "env_step" in entry:
+            if "returned_episode_returns" in entry:
+                env_steps.append(entry["env_step"])
+                returned_returns.append(entry["returned_episode_returns"])
+            if "test_returned_episode_returns" in entry:
+                test_returned_returns.append(entry["test_returned_episode_returns"])
+
+    # Save the data to CSV files
+    timestamp = int(time.time())
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Save returned_episode_returns vs env_step
+    csv_path_returns = os.path.join(save_dir, f"{timestamp}.csv")
+    with open(csv_path_returns, "w") as f:
+        f.write("env_step,returned_episode_returns\n")
+        for step, returns in zip(env_steps, returned_returns):
+            f.write(f"{step},{returns}\n")
+    print(f"CSV for returned_episode_returns saved to: {csv_path_returns}")
+
+    # Save test_returned_episode_returns vs env_step
+    csv_path_test_returns = os.path.join(save_dir, f"{timestamp}_NN.csv")
+    with open(csv_path_test_returns, "w") as f:
+        f.write("env_step,test_returned_episode_returns\n")
+        for step, test_returns in zip(env_steps, test_returned_returns):
+            f.write(f"{step},{test_returns}\n")
+    print(f"CSV for test_returned_episode_returns saved to: {csv_path_test_returns}")
+
 def single_run(config):
 
     config = {**config, **config["alg"]}
 
     alg_name = config.get("ALG_NAME", "pqn")
     env_name_deploy = config["ENV_NAME_DEPLOY"]
+    env_name_learn = config["ENV_NAME_LEARNING"]
 
     wandb.init(
         entity=config["ENTITY"],
@@ -509,8 +573,10 @@ def single_run(config):
         config=config,
         mode=config["WANDB_MODE"],
     )
-
+    
     rng = jax.random.PRNGKey(config["SEED"])
+
+    run_id = wandb.run.id
 
     t0 = time.time()
     rngs = jax.random.split(rng, config["NUM_SEEDS"])
@@ -518,11 +584,7 @@ def single_run(config):
     outs = jax.block_until_ready(train_vjit(rngs))
     print(f"Took {time.time()-t0} seconds to complete.")
 
-    # If you want to save again, uncomment the following lines
-    # if config.get("SAVE_PATH", None) is not None:
-    #     model_state = outs["runner_state"][0]
-    #     save_dir = os.path.join(config["SAVE_PATH"], env_name_deploy)
-    #     save_model_parameters(model_state, save_dir, alg_name, env_name_deploy, config["NUM_SEEDS"])
+    download_csv_from_wandb(run_id, config["PROJECT"], config["ENTITY"], f"visualization/Datasets2/{env_name_deploy}/{env_name_deploy}_Transfer_From_{env_name_learn}-Output-Reinit")
 
 @hydra.main(version_base=None, config_path="./config", config_name="config")
 def main(config):

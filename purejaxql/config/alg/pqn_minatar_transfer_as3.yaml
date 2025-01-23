@@ -1,7 +1,7 @@
 # this is adapted from Atari configuration (with a slightly higher exploration eps), may get better results with some tuning
 ALG_NAME: "pqn"
-TOTAL_TIMESTEPS: 0.5e7
-TOTAL_TIMESTEPS_DECAY: 0.5e7 # will be used for decay functions, in case you want to test for less timesteps and keep decays same
+TOTAL_TIMESTEPS: 2e7
+TOTAL_TIMESTEPS_DECAY: 2e7 # will be used for decay functions, in case you want to test for less timesteps and keep decays same
 NUM_ENVS: 128 # parallel environments
 NUM_STEPS: 32 # steps per environment in each update
 EPS_START: 1.
@@ -18,7 +18,7 @@ LAMBDA: 0.65
 
 # env specific
 ENV_NAME_LEARNING: "Asterix-MinAtar"
-ENV_NAME_DEPLOY: "Asterix-MinAtar"
+ENV_NAME_DEPLOY: "SpaceInvaders-MinAtar"
 LOAD_PATH: "models/Asterix-MinAtar/pqn_Asterix-MinAtar_seed0_vmap0.safetensors"
 ENV_KWARGS: {}
 
