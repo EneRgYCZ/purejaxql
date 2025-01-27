@@ -1,7 +1,7 @@
 import os
 import jax
-import csv
 import time
+import wandb
 import numpy as np
 from typing import Any
 import jax.numpy as jnp
@@ -13,7 +13,7 @@ import gymnax
 from flax import struct
 import flax.linen as nn
 from omegaconf import OmegaConf
-from safetensors.numpy import load_file
+from jaxmarl.wrappers.baselines import load_params
 from flax.core.frozen_dict import freeze, unfreeze
 from flax.training.train_state import TrainState
 from gymnax.wrappers.purerl import FlattenObservationWrapper, LogWrapper
@@ -75,86 +75,56 @@ class CustomTrainState(TrainState):
     n_updates: int = 0
     grad_steps: int = 0
 
-def reorganize_parameters(flat_params):
-    """
-    Convert flat parameter dictionary into a nested structure compatible with Flax.
-    """
-    nested_params = {}
-    for flat_key, value in flat_params.items():
-        # Split the flat key into hierarchical keys
-        keys = flat_key.split(',')
-        d = nested_params
-        for k in keys[:-1]:
-            d = d.setdefault(k, {})
-        d[keys[-1]] = value
-    return nested_params
-
 def load_model_parameters(file_path):
     """
-    Load the model parameters and batch_stats from a safetensors file and return them
-    as nested dictionaries suitable for TrainState.
+    Load the model parameters and batch_stats from a safetensors file
     """
-    loaded = load_file(file_path)
-    # Reorganize parameters into hierarchical structure
-    params_dict = reorganize_parameters(loaded)
-    return freeze(params_dict), freeze({})
+    loaded = load_params(file_path)
+    return freeze(loaded), freeze({})
 
-def reinitialize_layers_from_loaded(
-    loaded_params,
-    input_channels=None,
-    output_dim=None,
-    reinit_input=False,
-    reinit_output=False,
-):
+def reinit_layers_if_needed(network, 
+                            loaded_params, 
+                            rng_for_init, 
+                            input_shape, 
+                            force_reinit_names=()):
     """
-    Reinitialize the input and/or output layers of a loaded model while retaining other layers.
-    Args:
-        loaded_params (dict): The pretrained parameters loaded from a safetensor.
-        input_channels (int, optional): New input channels for the input layer (conv layer).
-        output_dim (int, optional): New output dimension for the output layer (dense layer).
-        reinit_input (bool): Whether to reinitialize the input layer.
-        reinit_output (bool): Whether to reinitialize the output layer.
-    Returns:
-        frozen_dict: Updated parameters with the reinitialized layers.
+    Create a fresh set of parameters for the `network`, then do a 
+    shape-based (or name-based) merge with `loaded_params`. 
+    Layers that have changed shape or appear in `force_reinit_names`
+    get reinitialized; all others use the old weights.
     """
-    params = unfreeze(loaded_params)  # Make the parameter dictionary mutable
+    # 1. Create a "fresh" param set for the new env shape
+    dummy_input = jnp.zeros((1, *input_shape), dtype=jnp.float32)
+    new_vars = network.init(rng_for_init, dummy_input, train=False)
+    new_params = unfreeze(new_vars["params"])
 
-    # Reinitialize Conv_0 in CNN_0 (Input Layer)
-    if reinit_input and "CNN_0" in params and "Conv_0" in params["CNN_0"]:
-        conv_layer = params["CNN_0"]["Conv_0"]
-        kernel_shape = conv_layer["kernel"].shape
+    # 2. Make a mutable copy of loaded_params
+    old_params = unfreeze(loaded_params)
 
-        if input_channels is None:
-            raise ValueError("Input channels must be specified to reinitialize the input layer.")
+    # 3. Recursively merge
+    def recursively_merge(old, new, path=()):
+        # path is used if you want to force-reinit by param name
+        if isinstance(old, dict) and isinstance(new, dict):
+            merged = {}
+            for k in new.keys():
+                merged[k] = recursively_merge(old.get(k, {}), new[k], path + (k,))
+            return merged
+        else:
+            # We have reached an actual array/tensor param
+            param_name = ".".join(path)
+            # shape-based or name-based check
+            if param_name in force_reinit_names:
+                # Force reinit
+                return new
+            elif old.shape == new.shape:
+                # Keep old param
+                return old
+            else:
+                # shape mismatch => reinit
+                return new
 
-        # Update kernel and bias for Conv_0
-        new_kernel_shape = (kernel_shape[0], kernel_shape[1], input_channels, kernel_shape[3])
-        conv_layer["kernel"] = nn.initializers.he_normal()(jax.random.PRNGKey(0), new_kernel_shape)
-        conv_layer["bias"] = jnp.zeros((new_kernel_shape[-1],), dtype=jnp.float32)
-
-    # Reinitialize Dense_0 (Output Layer)
-    if reinit_output and "Dense_0" in params:
-        dense_layer = params["Dense_0"]
-        kernel_shape = dense_layer["kernel"].shape
-
-        if output_dim is None:
-            raise ValueError("Output dimension must be specified to reinitialize the output layer.")
-
-        # Update kernel and bias for Dense_0
-        new_kernel_shape = (kernel_shape[0], output_dim)
-        dense_layer["kernel"] = nn.initializers.he_normal()(jax.random.PRNGKey(1), new_kernel_shape)
-        dense_layer["bias"] = jnp.zeros((output_dim,), dtype=jnp.float32)
-
-    # Ensure LayerNorm parameters remain consistent
-    for layer in ["LayerNorm_0", "LayerNorm_1"]:
-        if layer in params["CNN_0"]:
-            params["CNN_0"][layer] = loaded_params["CNN_0"][layer]
-
-    # Remove BatchNorm if present
-    if "BatchNorm_0" in params:
-        del params["BatchNorm_0"]
-
-    return freeze(params)  # Freeze updated parameters for immutability
+    merged_params = recursively_merge(old_params, new_params)
+    return freeze(merged_params), freeze(new_vars.get("batch_stats", {}))
 
 def make_train(config):
 
@@ -236,22 +206,49 @@ def make_train(config):
             load_path = config["LOAD_PATH"]
             loaded_params, _ = load_model_parameters(load_path)
 
-            # New input and output specifications
-            input_shape = env.observation_space(env_params).shape  # (Height, Width, Channels)
-            input_channels = input_shape[-1]  # Number of input channels
-            output_dim = env.action_space(env_params).n  # Number of actions
+            # Figure out new input shape and new output_dim
+            input_shape = env.observation_space(env_params).shape
+            output_dim = env.action_space(env_params).n
 
-            # Reinitialize the desired layers
-            reinitialized_params = reinitialize_layers_from_loaded(
-                loaded_params=loaded_params,
-                input_channels=input_channels,
-                output_dim=output_dim,
-                reinit_input=True,  # Reinitialize input layer
-                reinit_output=True,  # Reinitialize output layer
+            # Decide which layers to force reinit
+            # (e.g. the first conv if # channels changed, or the last dense for new # of actions)
+            force_reinit = []
+
+            # Example: check if CNN_0 Conv_0 kernel last dimension matches the new input channels
+            if (config['REINIT_INPUT']):
+                old_input_channels = loaded_params["CNN_0"]["Conv_0"]["kernel"].shape[2]
+                new_input_channels = input_shape[-1]
+                if old_input_channels != new_input_channels:
+                    force_reinit.append("CNN_0.Conv_0.bias")
+                    force_reinit.append("CNN_0.Conv_0.kernel")
+            
+            # Example: always reinit last Dense if action_dim changed 
+            if (config['REINIT_OUTPUT']):
+                old_outdim = loaded_params["Dense_0"]["bias"].shape[0]
+                if old_outdim != output_dim:
+                    force_reinit.append("Dense_0.bias")
+                    force_reinit.append("Dense_0.kernel")
+
+            # Reinit necessary layers
+            # create your network again with the new environment's dims
+            network = QNetwork(
+                action_dim=output_dim,
+                norm_type=config["NORM_TYPE"],
+                norm_input=config.get("NORM_INPUT", False),
             )
 
-            # Update the train state
-            train_state = train_state.replace(params=reinitialized_params)
+            rng_for_init = jax.random.PRNGKey(999)  # or any seed you like
+            new_params, new_batch_stats = reinit_layers_if_needed(
+                network,
+                loaded_params,
+                rng_for_init,
+                input_shape,
+                force_reinit_names=tuple(force_reinit),
+            )
+
+            # Now update your train state
+            train_state = train_state.replace(params=new_params,
+                                            batch_stats=new_batch_stats)
 
         def get_test_metrics(train_state, rng):
             if not config.get("TEST_DURING_TRAINING", False):
@@ -386,36 +383,28 @@ def make_train(config):
                     minibatch, target = minibatch_and_target
 
                     def _loss_fn(params):
-                        # Apply the network with the current (mutable) parameters
                         q_vals, updates = network.apply(
                             {"params": params, "batch_stats": train_state.batch_stats},
                             minibatch.obs,
                             train=True,
-                            mutable=["batch_stats"],  # Batch norm updates if needed
+                            mutable=["batch_stats"],
                         )
-
                         chosen_action_qvals = jnp.take_along_axis(
                             q_vals,
                             jnp.expand_dims(minibatch.action, axis=-1),
                             axis=-1,
                         ).squeeze(axis=-1)
-
                         loss = 0.5 * jnp.square(chosen_action_qvals - target).mean()
                         return loss, (updates, chosen_action_qvals)
 
-                    # Unfreeze the parameters to allow updates
+                    # Unfreeze/Freeze as usual for param updates
                     mutable_params = unfreeze(train_state.params)
-
-                    # Calculate loss and gradients
-                    (loss, (updates, qvals)), grads = jax.value_and_grad(
-                        _loss_fn, has_aux=True
-                    )(mutable_params)
-
-                    # Apply the gradients
+                    (loss, (updates, qvals)), grads = jax.value_and_grad(_loss_fn, has_aux=True)(mutable_params)
                     train_state = train_state.apply_gradients(grads=freeze(grads))
 
-                    # Update batch_stats if necessary
-                    train_state = train_state.replace(batch_stats=updates["batch_stats"])
+                    # IMPORTANT: freeze the updated batch_stats so it remains a FrozenDict
+                    new_batch_stats = freeze(updates["batch_stats"])
+                    train_state = train_state.replace(batch_stats=new_batch_stats)
 
                     return (train_state, rng), (loss, qvals)
 
@@ -505,10 +494,6 @@ def make_train(config):
 
     return train
 
-import os
-import time
-import wandb
-
 def download_csv_from_wandb(run_id, project_name, entity_name, save_dir):
     """
     Download the CSV files for a specific WandB run.
@@ -584,7 +569,7 @@ def single_run(config):
     outs = jax.block_until_ready(train_vjit(rngs))
     print(f"Took {time.time()-t0} seconds to complete.")
 
-    download_csv_from_wandb(run_id, config["PROJECT"], config["ENTITY"], f"visualization/Datasets2/{env_name_deploy}/{env_name_deploy}_Transfer_From_{env_name_learn}-Output-Reinit")
+    download_csv_from_wandb(run_id, config["PROJECT"], config["ENTITY"], f"visualization/Dataset/{env_name_deploy}/{env_name_deploy}_Transfer_From_{env_name_learn}")
 
 @hydra.main(version_base=None, config_path="./config", config_name="config")
 def main(config):

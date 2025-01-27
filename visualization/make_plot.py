@@ -41,7 +41,7 @@ def process_files(file_list, rolling_window=10, policy_type="", subfolder_name="
      data_frames = []
      for file in file_list:
           # Load the CSV file
-          df = pd.read_csv(file, usecols=[0, 1], header=0)  # Column A (env_step) and E (return)
+          df = pd.read_csv(file, usecols=[0, 1], header=0)  # Column A (env_step) and B (return)
           df.columns = ['env_step', 'return']
           
           # Apply additional filtering for Target Policy files (files with "NN")
@@ -116,8 +116,8 @@ def main():
      """
      Main function to select a folder, process data, and generate separate plots for target and behavior policies.
      """
-     # Set the folder path for visualization (e.g., "Datasets/Asterix")
-     folder = input("Enter the folder name (e.g., 'Datasets/Asterix'): ")
+     # Set the folder path for visualization (e.g., "Dataset/Asterix")
+     folder = input("Enter the folder name (e.g., 'Dataset/Asterix'): ")
      env_name = folder.split('/')[-1]
      
      if not os.path.exists(folder):
@@ -129,6 +129,7 @@ def main():
      
      all_target_data = []
      all_behavior_data = []
+
      
      # Process files for each subfolder
      for subfolder, files in subfolder_data.items():
@@ -136,7 +137,7 @@ def main():
           behavior_data = process_files(files['Behavior'], rolling_window=100, policy_type="Behavior", subfolder_name=subfolder)
           all_target_data.append(target_data)
           all_behavior_data.append(behavior_data)
-     
+
      # Combine data across subfolders for each policy type
      target_policy_df = pd.concat(all_target_data, ignore_index=True) if all_target_data else pd.DataFrame()
      behavior_policy_df = pd.concat(all_behavior_data, ignore_index=True) if all_behavior_data else pd.DataFrame()
