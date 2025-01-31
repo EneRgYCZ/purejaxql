@@ -70,17 +70,6 @@ Use the scripts in the `visualization` directory to analyze and visualize result
    python visualization/make_plot.py
    ```
 
-## Results
-The results of the experiments, including plots for behavior and target policies, are stored in the `results` directory. Example plots:
-
-### Behavior Policy
-#### Asterix
-![Behavior Policy](results/Behavior-Policy-Asterix-From-Breakout.png) 
-
-### Target Policy
-#### Asterix
-![Target Policy](results/Target-Policy-Asterix-From-Breakout.png)
-
 ## Reproducibility
 The experiments are designed to be fully reproducible. Random seeds are explicitly set in the `config.yaml` file to ensure consistent results. All dependencies and configurations are contained within the Docker environment or specified in the requirements file.
 

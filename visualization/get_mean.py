@@ -7,7 +7,7 @@ def process_run(file_path):
     Process a single run file to extract environment steps and returns.
     """
     try:
-        df = pd.read_csv(file_path, usecols=[0, 4], header=0)  # Use columns for env_step and return
+        df = pd.read_csv(file_path, usecols=[0, 1], header=0)  # Use columns for env_step and return
         df.columns = ['env_step', 'return']
         return df
     except Exception as e:
